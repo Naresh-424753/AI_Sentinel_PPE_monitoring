@@ -12,3 +12,9 @@ backend/reports/
 backend/.jwt_secret
 runs/
 *.pt
+
+backend/proofs/
+backend/incidents/
+backend/clips/
+backend/training_frames/
+backend/reports/
