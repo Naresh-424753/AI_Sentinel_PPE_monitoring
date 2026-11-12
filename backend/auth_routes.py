@@ -3,6 +3,7 @@ Logic is carried over from the original api.py; routes keep the same paths."""
 import hashlib
 import secrets
 import smtplib
+from backend import mailer
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 
@@ -401,10 +402,7 @@ def send_email_otp(
     # DEVELOPMENT MODE
     # --------------------------------------------------------
 
-    if (
-        not SMTP_EMAIL
-        or not SMTP_PASSWORD
-    ):
+    if not mailer.configured():
 
         print()
         print(
@@ -432,18 +430,7 @@ def send_email_otp(
     # CREATE EMAIL
     # --------------------------------------------------------
 
-    message = EmailMessage()
-
-    message["Subject"] = (
-        "AI Sentinel - Password Reset OTP"
-    )
-
-    message["From"] = SMTP_EMAIL
-
-    message["To"] = email
-
-    message.set_content(
-        f"""
+    body = f"""
 AI Sentinel Password Reset
 
 Your password reset OTP is:
@@ -458,34 +445,18 @@ please ignore this email.
 
 AI Sentinel Security Team
 """
-    )
 
     # --------------------------------------------------------
-    # SEND EMAIL
+    # SEND EMAIL (Brevo if BREVO_API_KEY is set, otherwise SMTP)
     # --------------------------------------------------------
 
     try:
 
-        with smtplib.SMTP(
-            SMTP_HOST,
-            SMTP_PORT,
-            timeout=20
-        ) as server:
-
-            server.ehlo()
-
-            server.starttls()
-
-            server.ehlo()
-
-            server.login(
-                SMTP_EMAIL,
-                SMTP_PASSWORD
-            )
-
-            server.send_message(
-                message
-            )
+        mailer.send(
+            email,
+            "AI Sentinel - Password Reset OTP",
+            body
+        )
 
         print(
             f"📧 EMAIL OTP SENT: {email}"
