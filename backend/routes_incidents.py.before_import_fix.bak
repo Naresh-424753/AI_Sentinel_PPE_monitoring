@@ -1,0 +1,1460 @@
+from typing import Optional
+import os
+import base64
+import secrets
+
+import cv2
+import numpy as np
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+)
+from fastapi.responses import Response, FileResponse
+from pydantic import BaseModel, Field
+
+from backend import config
+from backend.db import get_db, log_audit, now_str
+from backend.auth import get_current_user, require_role
+from backend.services import notification_service as notify
+from backend.services import report_service
+from backend.services.event_bus import bus
+
+
+router = APIRouter()
+
+CLOSED = {
+    "RESOLVED",
+    "FALSE_POSITIVE",
+}
+
+STATUSES = {
+    "OPEN",
+    "ASSIGNED",
+    "IN_PROGRESS",
+    "RESOLVED",
+    "FALSE_POSITIVE",
+}
+
+
+# ============================================================
+# USER HELPERS
+# ============================================================
+
+def user_name(user):
+    if isinstance(user, dict):
+        return (
+            user.get("name")
+            or user.get("email")
+            or "User"
+        )
+
+    return (
+        getattr(user, "name", None)
+        or getattr(user, "email", None)
+        or "User"
+    )
+
+
+def user_email(user):
+    if isinstance(user, dict):
+        return str(user.get("email") or "")
+
+    return str(getattr(user, "email", "") or "")
+
+
+def is_staff(user):
+    if isinstance(user, dict):
+        role = user.get("role")
+    else:
+        role = getattr(user, "role", None)
+
+    return str(role or "").upper() in {
+        "ADMIN",
+        "SUPERVISOR",
+    }
+
+
+def is_assigned_to_user(row, user):
+    assigned_to = str(
+        row["assigned_to"] or ""
+    ).strip().lower()
+
+    if not assigned_to:
+        return False
+
+    email = user_email(user).strip().lower()
+    name = user_name(user).strip().lower()
+
+    return assigned_to in {
+        email,
+        name,
+    }
+
+
+def pretty(value):
+    return str(value or "").replace("_", " ").title()
+
+
+# ============================================================
+# OVERDUE HELPER
+# ============================================================
+
+def with_overdue(row):
+    due_at = row.get("due_at")
+    status = str(row.get("status") or "").upper()
+
+    overdue = False
+
+    if due_at and status not in CLOSED:
+        try:
+            due = __import__("datetime").datetime.strptime(
+                due_at,
+                "%Y-%m-%d %H:%M:%S",
+            )
+            overdue = (
+                due
+                < __import__("datetime").datetime.now()
+            )
+        except (ValueError, TypeError):
+            overdue = False
+
+    row["overdue"] = overdue
+
+    return row
+
+
+# ============================================================
+# FILTER BUILDER
+# ============================================================
+
+def build_filters(
+    status=None,
+    violation=None,
+    severity=None,
+    camera_id=None,
+    q=None,
+    date_from=None,
+    date_to=None,
+    assigned_to=None,
+    overdue=None,
+    review=None,
+):
+    where = []
+    params = []
+
+    if status:
+        where.append("UPPER(status) = ?")
+        params.append(status.strip().upper())
+
+    if violation:
+        where.append("violation = ?")
+        params.append(violation)
+
+    if severity:
+        where.append("UPPER(severity) = ?")
+        params.append(severity.strip().upper())
+
+    if camera_id is not None:
+        where.append("camera_id = ?")
+        params.append(camera_id)
+
+    if assigned_to:
+        where.append("assigned_to LIKE ?")
+        params.append(f"%{assigned_to.strip()}%")
+
+    # --------------------------------------------------------
+    # AI REVIEW FILTERS
+    # --------------------------------------------------------
+
+    if review:
+        review_value = review.strip().lower()
+
+        if review_value in ("needs", "needs_review"):
+            where.append(
+                """
+                status IN ('OPEN', 'ASSIGNED')
+                AND UPPER(COALESCE(ai_review, '')) IN (
+                    'NEEDS_REVIEW',
+                    'LOW_CONFIDENCE'
+                )
+                """
+            )
+
+        elif review_value in ("auto", "auto_resolved"):
+            where.append(
+                "UPPER(COALESCE(ai_review, '')) = 'AUTO_RESOLVED'"
+            )
+
+        elif review_value == "reopened":
+            where.append(
+                "UPPER(COALESCE(ai_review, '')) = 'REOPENED'"
+            )
+
+        elif review_value == "low_confidence":
+            where.append(
+                "UPPER(COALESCE(ai_review, '')) = 'LOW_CONFIDENCE'"
+            )
+
+        # Explicit exact NEEDS_REVIEW filter
+        elif review_value == "needs_review_exact":
+            where.append(
+                "UPPER(COALESCE(ai_review, '')) = 'NEEDS_REVIEW'"
+            )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid AI review filter",
+            )
+
+    # --------------------------------------------------------
+    # DATE FILTERS
+    # --------------------------------------------------------
+
+    if date_from:
+        where.append("timestamp >= ?")
+        params.append(date_from)
+
+    if date_to:
+        where.append("timestamp <= ?")
+        params.append(date_to + " 23:59:59")
+
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
+
+    if q:
+        like = f"%{q.strip()}%"
+
+        where.append(
+            """
+            (
+                incident_id LIKE ?
+                OR violation LIKE ?
+                OR camera_name LIKE ?
+                OR assigned_to LIKE ?
+                OR zone LIKE ?
+                OR description LIKE ?
+            )
+            """
+        )
+
+        params.extend([like] * 6)
+
+    # --------------------------------------------------------
+    # OVERDUE FILTER
+    # --------------------------------------------------------
+
+    if overdue is True:
+        where.append(
+            """
+            due_at IS NOT NULL
+            AND due_at < ?
+            AND UPPER(COALESCE(status, '')) NOT IN (
+                'RESOLVED',
+                'FALSE_POSITIVE'
+            )
+            """
+        )
+        params.append(now_str())
+
+    elif overdue is False:
+        where.append(
+            """
+            (
+                due_at IS NULL
+                OR due_at >= ?
+                OR UPPER(COALESCE(status, '')) IN (
+                    'RESOLVED',
+                    'FALSE_POSITIVE'
+                )
+            )
+            """
+        )
+        params.append(now_str())
+
+    if not where:
+        return "", params
+
+    return " WHERE " + " AND ".join(where), params
+
+
+# ============================================================
+# FETCH INCIDENTS
+# ============================================================
+
+def fetch(where, params, limit=None, offset=0):
+    conn = get_db()
+
+    try:
+        sql = f"""
+            SELECT *
+            FROM incidents
+            {where}
+            ORDER BY id DESC
+        """
+
+        args = list(params)
+
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args.extend([
+                int(limit),
+                int(offset),
+            ])
+
+        rows = [
+            with_overdue(dict(row))
+            for row in conn.execute(
+                sql,
+                args,
+            ).fetchall()
+        ]
+
+        total = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM incidents
+            {where}
+            """,
+            params,
+        ).fetchone()[0]
+
+        return rows, total
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# SAVE PROOF IMAGE
+# ============================================================
+
+def save_proof(incident_id, data):
+    """
+    Accept raw base64 or a data:image/...;base64,... URL.
+    Store a resized JPEG in PROOFS_DIR.
+    """
+
+    if not data:
+        return None
+
+    if "," in data[:200]:
+        header, data = data.split(",", 1)
+
+        if not header.lower().startswith("data:image/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image data URL",
+            )
+
+    try:
+        raw = base64.b64decode(
+            data,
+            validate=True,
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image data",
+        )
+
+    if len(raw) > 8 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Image is too large (max 8 MB)",
+        )
+
+    image = cv2.imdecode(
+        np.frombuffer(raw, np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+
+    if image is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded data is not a valid image",
+        )
+
+    height, width = image.shape[:2]
+
+    if width <= 0 or height <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image dimensions",
+        )
+
+    max_size = 1280
+    scale = min(1.0, max_size / max(width, height))
+
+    if scale < 1:
+        image = cv2.resize(
+            image,
+            (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    os.makedirs(
+        config.PROOFS_DIR,
+        exist_ok=True,
+    )
+
+    filename = (
+        f"{incident_id}_"
+        f"{secrets.token_hex(6)}.jpg"
+    )
+
+    path = os.path.join(
+        config.PROOFS_DIR,
+        filename,
+    )
+
+    ok = cv2.imwrite(
+        path,
+        image,
+        [
+            cv2.IMWRITE_JPEG_QUALITY,
+            85,
+        ],
+    )
+
+    if not ok:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save proof image",
+        )
+
+    return filename
+
+
+# ============================================================
+# SYSTEM COMMENTS
+# ============================================================
+
+def add_system_comment(conn, incident_id, message):
+    conn.execute(
+        """
+        INSERT INTO incident_comments (
+            incident_id,
+            author,
+            author_email,
+            message,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            incident_id,
+            "System",
+            "",
+            message,
+            now_str(),
+        ),
+    )
+
+
+# ============================================================
+# NOTIFICATION HELPERS
+# ============================================================
+
+def notify_assignment(
+    incident_id,
+    incident_row,
+    assigned_to,
+    assigned_by_user,
+):
+    if not assigned_to:
+        return
+
+    try:
+        users = notify.find_users(assigned_to)
+
+        targets = [
+            item.get("email")
+            for item in users
+            if item.get("email")
+        ]
+
+        if not targets:
+            return
+
+        violation = pretty(incident_row.get("violation"))
+        camera = incident_row.get("camera_name") or "camera"
+
+        message = (
+            f"{incident_id} ({violation} on {camera}) "
+            f"was assigned to you by "
+            f"{user_name(assigned_by_user)}. "
+            f"Deadline: {incident_row.get('due_at') or '-'}."
+        )
+
+        notify.notify(
+            targets,
+            f"Assigned to you: {incident_id}",
+            message,
+            incident_id,
+            email=True,
+            exclude=user_email(assigned_by_user),
+        )
+
+    except Exception as exc:
+        print("assignment notification error:", exc)
+
+
+def notify_resolution(incident_id, incident_row, user):
+    try:
+        assigned_by = incident_row.get("assigned_by")
+
+        if assigned_by:
+            targets = [assigned_by]
+        else:
+            targets = [
+                item.get("email")
+                for item in notify.users_with_role("SUPERVISOR")
+                if item.get("email")
+            ]
+
+        targets = [target for target in targets if target]
+
+        if not targets:
+            return
+
+        violation = pretty(incident_row.get("violation"))
+        camera = incident_row.get("camera_name") or "camera"
+
+        notify.notify(
+            targets,
+            f"Resolved: {incident_id}",
+            (
+                f"{incident_id} ({violation} on {camera}) "
+                f"was marked resolved by {user_name(user)}."
+            ),
+            incident_id,
+            email=True,
+            exclude=user_email(user),
+        )
+
+    except Exception as exc:
+        print("resolution notification error:", exc)
+
+
+def notify_reply(
+    incident_id,
+    user,
+    message,
+    assigned_to,
+    assigned_by,
+):
+    try:
+        if not assigned_to:
+            return
+
+        assignee_users = notify.find_users(assigned_to)
+
+        assignee_emails = [
+            item.get("email")
+            for item in assignee_users
+            if item.get("email")
+        ]
+
+        current_email = user_email(user).lower()
+
+        assignee_email_set = {
+            email.lower()
+            for email in assignee_emails
+        }
+
+        if current_email in assignee_email_set:
+            if assigned_by:
+                targets = [assigned_by]
+            else:
+                targets = [
+                    item.get("email")
+                    for item in notify.users_with_role("SUPERVISOR")
+                    if item.get("email")
+                ]
+        else:
+            targets = assignee_emails
+
+        targets = [
+            target
+            for target in targets
+            if target and target.lower() != current_email
+        ]
+
+        if targets:
+            notify.notify(
+                targets,
+                f"New reply on {incident_id}",
+                f"{user_name(user)}: {message[:140]}",
+                incident_id,
+                email=True,
+                exclude=user_email(user),
+            )
+
+    except Exception as exc:
+        print("reply notification error:", exc)
+
+
+# ============================================================
+# LIST INCIDENTS
+# ============================================================
+
+@router.get("/api/incidents")
+def list_incidents(
+    status: Optional[str] = None,
+    violation: Optional[str] = None,
+    severity: Optional[str] = None,
+    camera_id: Optional[int] = None,
+    q: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    overdue: Optional[bool] = None,
+    review: Optional[str] = None,
+    limit: int = Query(25, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    user=Depends(get_current_user),
+):
+    where, params = build_filters(
+        status=status,
+        violation=violation,
+        severity=severity,
+        camera_id=camera_id,
+        q=q,
+        date_from=date_from,
+        date_to=date_to,
+        assigned_to=assigned_to,
+        overdue=overdue,
+        review=review,
+    )
+
+    items, total = fetch(
+        where,
+        params,
+        limit,
+        offset,
+    )
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+# ============================================================
+# LEGACY INCIDENT LIST
+# ============================================================
+
+@router.get("/incidents")
+def legacy_list(
+    user=Depends(get_current_user),
+):
+    items, _ = fetch("", [], 1000, 0)
+    return items
+
+
+# ============================================================
+# GET ONE INCIDENT
+# ============================================================
+
+@router.get("/incidents/{incident_id}")
+def get_incident(
+    incident_id: str,
+    user=Depends(get_current_user),
+):
+    conn = get_db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found",
+            )
+
+        return with_overdue(dict(row))
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
+
+class IncidentPatch(BaseModel):
+    status: Optional[str] = None
+    assigned_to: Optional[str] = None
+    resolution_notes: Optional[str] = None
+
+
+class UserIncidentReply(BaseModel):
+    resolution_notes: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+    )
+
+
+class CommentBody(BaseModel):
+    message: str = Field(default="", max_length=1000)
+    image: Optional[str] = None
+
+
+# ============================================================
+# ASSIGNED USER REPLY
+# ============================================================
+
+@router.patch("/incidents/{incident_id}/reply")
+def user_reply_incident(
+    incident_id: str,
+    body: UserIncidentReply,
+    user=Depends(get_current_user),
+):
+    reply = body.resolution_notes.strip()
+
+    if not reply:
+        raise HTTPException(
+            status_code=400,
+            detail="Reply cannot be empty",
+        )
+
+    conn = get_db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found",
+            )
+
+        if not is_assigned_to_user(row, user):
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this incident",
+            )
+
+        if str(row["status"] or "").upper() in CLOSED:
+            raise HTTPException(
+                status_code=400,
+                detail="This incident is already closed",
+            )
+
+        timestamp = now_str()
+
+        conn.execute(
+            """
+            UPDATE incidents
+            SET resolution_notes = ?, updated_at = ?
+            WHERE incident_id = ?
+            """,
+            (
+                reply,
+                timestamp,
+                incident_id,
+            ),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO incident_comments (
+                incident_id,
+                author,
+                author_email,
+                message,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                incident_id,
+                user_name(user),
+                user_email(user),
+                reply,
+                timestamp,
+            ),
+        )
+
+        conn.commit()
+
+        updated = conn.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        out = with_overdue(dict(updated))
+
+        assigned_to = row["assigned_to"]
+        assigned_by = row["assigned_by"]
+
+    finally:
+        conn.close()
+
+    log_audit(
+        user_email(user),
+        "INCIDENT_REPLY",
+        "incident",
+        incident_id,
+        reply[:80],
+    )
+
+    bus.publish({
+        "type": "incident_updated",
+        "incident_id": incident_id,
+    })
+
+    bus.publish({
+        "type": "comment",
+        "incident_id": incident_id,
+    })
+
+    notify_reply(
+        incident_id,
+        user,
+        reply,
+        assigned_to,
+        assigned_by,
+    )
+
+    return {
+        "success": True,
+        "message": "Reply submitted successfully",
+        "incident": out,
+    }
+
+
+# ============================================================
+# UPDATE INCIDENT
+# ============================================================
+
+@router.patch("/incidents/{incident_id}")
+def update_incident(
+    incident_id: str,
+    body: IncidentPatch,
+    user=Depends(get_current_user),
+):
+    conn = get_db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found",
+            )
+
+        staff = is_staff(user)
+        mine = is_assigned_to_user(row, user)
+
+        if not staff:
+            if not mine:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "Only the assigned person "
+                        "or a supervisor can update this incident"
+                    ),
+                )
+
+            if body.assigned_to is not None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only a supervisor can reassign an incident",
+                )
+
+            if (
+                body.status is not None
+                and body.status.strip().upper() != "RESOLVED"
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="You can only mark your incident as resolved",
+                )
+
+        fields = {}
+
+        if body.status is not None:
+            new_status = body.status.strip().upper()
+
+            if new_status not in STATUSES:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid incident status",
+                )
+
+            fields["status"] = new_status
+
+        if body.assigned_to is not None:
+            assigned = body.assigned_to.strip()
+
+            fields["assigned_to"] = assigned or None
+
+        if body.resolution_notes is not None:
+            fields["resolution_notes"] = (
+                body.resolution_notes.strip()
+            )
+
+        old_status = str(row["status"] or "").upper()
+        old_ai_review = str(row["ai_review"] or "").upper()
+
+        old_assigned = str(row["assigned_to"] or "").strip()
+        new_assigned = str(
+            fields.get("assigned_to", row["assigned_to"]) or ""
+        ).strip()
+
+        assignment_changed = (
+            "assigned_to" in fields
+            and new_assigned != old_assigned
+        )
+
+        if assignment_changed:
+            fields["assigned_by"] = (
+                user_email(user) if new_assigned else None
+            )
+
+            if new_assigned and "status" not in fields:
+                if old_status == "OPEN":
+                    fields["status"] = "ASSIGNED"
+
+        new_status = fields.get("status", old_status)
+
+        if new_status != old_status:
+            fields["resolved_at"] = (
+                now_str() if new_status in CLOSED else None
+            )
+
+        reopened = (
+            old_ai_review == "AUTO_RESOLVED"
+            and new_status in {"OPEN", "ASSIGNED"}
+            and new_status != old_status
+        )
+
+        if reopened:
+            fields["ai_review"] = "REOPENED"
+
+        if not fields:
+            raise HTTPException(
+                status_code=400,
+                detail="Nothing to update",
+            )
+
+        fields["updated_at"] = now_str()
+
+        columns = ", ".join(
+            f"{key} = ?"
+            for key in fields
+        )
+
+        conn.execute(
+            f"""
+            UPDATE incidents
+            SET {columns}
+            WHERE incident_id = ?
+            """,
+            (
+                *fields.values(),
+                incident_id,
+            ),
+        )
+
+        actor = user_name(user)
+
+        if reopened:
+            add_system_comment(
+                conn,
+                incident_id,
+                f"Reopened by {actor} (the AI had marked it solved)",
+            )
+
+        if assignment_changed:
+            add_system_comment(
+                conn,
+                incident_id,
+                f"Assigned to {new_assigned or 'Nobody'} by {actor}",
+            )
+
+        if new_status == "RESOLVED" and old_status != "RESOLVED":
+            add_system_comment(
+                conn,
+                incident_id,
+                f"Marked resolved by {actor}",
+            )
+
+        if (
+            new_status == "FALSE_POSITIVE"
+            and old_status != "FALSE_POSITIVE"
+        ):
+            add_system_comment(
+                conn,
+                incident_id,
+                f"Marked as false alarm by {actor}",
+            )
+
+        conn.commit()
+
+        updated_row = conn.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        out = with_overdue(dict(updated_row))
+
+    finally:
+        conn.close()
+
+    detail = ", ".join(
+        f"{key}={value}"
+        for key, value in fields.items()
+        if key not in {"updated_at", "resolved_at"}
+    )
+
+    log_audit(
+        user_email(user),
+        "INCIDENT_UPDATE",
+        "incident",
+        incident_id,
+        detail,
+    )
+
+    bus.publish({
+        "type": "incident_updated",
+        "incident_id": incident_id,
+    })
+
+    if assignment_changed and new_assigned:
+        notify_assignment(
+            incident_id,
+            out,
+            new_assigned,
+            user,
+        )
+
+    if new_status == "RESOLVED" and old_status != "RESOLVED":
+        notify_resolution(
+            incident_id,
+            out,
+            user,
+        )
+
+    return out
+
+
+# ============================================================
+# LIST COMMENTS
+# ============================================================
+
+@router.get("/incidents/{incident_id}/comments")
+def list_comments(
+    incident_id: str,
+    user=Depends(get_current_user),
+):
+    conn = get_db()
+
+    try:
+        incident = conn.execute(
+            """
+            SELECT incident_id
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not incident:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found",
+            )
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM incident_comments
+            WHERE incident_id = ?
+            ORDER BY id ASC
+            """,
+            (incident_id,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# ADD COMMENT
+# ============================================================
+
+@router.post("/incidents/{incident_id}/comments")
+def add_comment(
+    incident_id: str,
+    body: CommentBody,
+    user=Depends(get_current_user),
+):
+    message = body.message.strip()
+
+    if not message and not body.image:
+        raise HTTPException(
+            status_code=400,
+            detail="Write a message or attach a photo",
+        )
+
+    conn = get_db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT assigned_to, assigned_by, status
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found",
+            )
+
+        if not (is_staff(user) or is_assigned_to_user(row, user)):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assigned person or a supervisor can reply",
+            )
+
+        attachment = (
+            save_proof(incident_id, body.image)
+            if body.image
+            else None
+        )
+
+        timestamp = now_str()
+        stored_message = message or "[Photo]"
+
+        conn.execute(
+            """
+            INSERT INTO incident_comments (
+                incident_id,
+                author,
+                author_email,
+                message,
+                attachment,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                incident_id,
+                user_name(user),
+                user_email(user),
+                stored_message,
+                attachment,
+                timestamp,
+            ),
+        )
+
+        conn.execute(
+            """
+            UPDATE incidents
+            SET updated_at = ?
+            WHERE incident_id = ?
+            """,
+            (
+                timestamp,
+                incident_id,
+            ),
+        )
+
+        conn.commit()
+
+        assigned_to = row["assigned_to"]
+        assigned_by = row["assigned_by"]
+
+    finally:
+        conn.close()
+
+    log_audit(
+        user_email(user),
+        "INCIDENT_REPLY",
+        "incident",
+        incident_id,
+        stored_message[:80],
+    )
+
+    bus.publish({
+        "type": "comment",
+        "incident_id": incident_id,
+    })
+
+    bus.publish({
+        "type": "incident_updated",
+        "incident_id": incident_id,
+    })
+
+    notify_reply(
+        incident_id,
+        user,
+        message or "sent a photo",
+        assigned_to,
+        assigned_by,
+    )
+
+    return {
+        "success": True,
+        "message": "Comment added successfully",
+        "attachment": attachment,
+    }
+
+
+# ============================================================
+# DELETE INCIDENT
+# ============================================================
+
+@router.delete("/incidents/{incident_id}")
+def delete_incident(
+    incident_id: str,
+    user=Depends(require_role("ADMIN")),
+):
+    conn = get_db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT screenshot, clip
+            FROM incidents
+            WHERE incident_id = ?
+            """,
+            (incident_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found",
+            )
+
+        proof_rows = conn.execute(
+            """
+            SELECT attachment
+            FROM incident_comments
+            WHERE incident_id = ?
+              AND attachment IS NOT NULL
+            """,
+            (incident_id,),
+        ).fetchall()
+
+        proofs = [
+            item["attachment"]
+            for item in proof_rows
+            if item["attachment"]
+        ]
+
+        conn.execute(
+            "DELETE FROM incident_comments WHERE incident_id = ?",
+            (incident_id,),
+        )
+
+        conn.execute(
+            "DELETE FROM incidents WHERE incident_id = ?",
+            (incident_id,),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+    files = [
+        (config.INCIDENTS_DIR, row["screenshot"]),
+        (config.CLIPS_DIR, row["clip"]),
+    ]
+
+    files.extend(
+        (config.PROOFS_DIR, filename)
+        for filename in proofs
+    )
+
+    files.extend([
+        (config.TRAINING_DIR, f"{incident_id}.jpg"),
+        (config.TRAINING_DIR, f"{incident_id}.txt"),
+    ])
+
+    for folder, filename in files:
+        if not filename:
+            continue
+
+        path = os.path.join(
+            folder,
+            os.path.basename(filename),
+        )
+
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            print("file delete error:", exc)
+
+    log_audit(
+        user_email(user),
+        "INCIDENT_DELETE",
+        "incident",
+        incident_id,
+    )
+
+    bus.publish({
+        "type": "incident_deleted",
+        "incident_id": incident_id,
+    })
+
+    return {
+        "success": True,
+        "message": f"{incident_id} deleted",
+    }
+
+
+# ============================================================
+# EXPORT INCIDENTS
+# ============================================================
+
+@router.get("/api/incidents/export")
+def export_incidents(
+    format: str = Query(
+        "csv",
+        pattern="^(csv|xlsx|pdf)$",
+    ),
+    status: Optional[str] = None,
+    violation: Optional[str] = None,
+    severity: Optional[str] = None,
+    camera_id: Optional[int] = None,
+    q: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    overdue: Optional[bool] = None,
+    review: Optional[str] = None,
+    user=Depends(get_current_user),
+):
+    where, params = build_filters(
+        status=status,
+        violation=violation,
+        severity=severity,
+        camera_id=camera_id,
+        q=q,
+        date_from=date_from,
+        date_to=date_to,
+        assigned_to=assigned_to,
+        overdue=overdue,
+        review=review,
+    )
+
+    rows, _ = fetch(where, params, 5000, 0)
+
+    log_audit(
+        user_email(user),
+        "EXPORT",
+        "incidents",
+        format,
+        f"{len(rows)} rows",
+    )
+
+    if format == "csv":
+        return Response(
+            report_service.to_csv(rows),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition":
+                    'attachment; filename="incidents.csv"'
+            },
+        )
+
+    if format == "xlsx":
+        return Response(
+            report_service.to_xlsx(rows),
+            media_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            headers={
+                "Content-Disposition":
+                    'attachment; filename="incidents.xlsx"'
+            },
+        )
+
+    path = report_service.generate_pdf_report(rows)
+
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename="Safety_Audit_Report.pdf",
+    )
+
+
+# ============================================================
+# LEGACY PDF EXPORT
+# ============================================================
+
+@router.get("/api/export-pdf")
+def export_pdf(
+    user=Depends(get_current_user),
+):
+    rows, _ = fetch("", [], 200, 0)
+
+    path = report_service.generate_pdf_report(rows)
+
+    log_audit(
+        user_email(user),
+        "EXPORT",
+        "incidents",
+        "pdf",
+        f"{len(rows)} rows",
+    )
+
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename="Safety_Audit_Report.pdf",
+    )

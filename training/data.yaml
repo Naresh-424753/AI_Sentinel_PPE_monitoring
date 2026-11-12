@@ -1,0 +1,17 @@
+path: D:/AI-Sentinel/datasets/construction-ppe
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: person
+  1: helmet
+  2: no_helmet
+  3: safety_vest
+  4: no_vest
+  5: gloves
+  6: no_gloves
+  7: goggle
+  8: no_goggle
+  9: boots
+  10: no_boots

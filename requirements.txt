@@ -1,0 +1,16 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic[email]>=2.6
+python-dotenv>=1.0
+passlib[bcrypt]>=1.7.4
+bcrypt==4.0.1
+PyJWT>=2.7
+requests>=2.31
+numpy
+opencv-python>=4.9
+ultralytics>=8.3
+lapx>=0.5.5
+openpyxl>=3.1
+reportlab>=4.0
+imageio-ffmpeg>=0.4.9
+pywebpush>=2.0

@@ -1,0 +1,196 @@
+import React, { useCallback, useEffect, useState } from "react";
+import { api, asset, download } from "../api.js";
+import { useAuth } from "../auth.jsx";
+import { useLive } from "../live.jsx";
+import { Empty, Modal, STATUS_LABEL, Sev, Status, fmtTime, pretty } from "../ui.jsx";
+
+const PAGE = 25;
+const EMPTY = { q: "", status: "", severity: "", violation: "", camera_id: "", date_from: "", date_to: "" };
+
+function Detail({ inc, onClose, onSaved }) {
+  const { can } = useAuth();
+  const editable = can("SUPERVISOR");
+  const [users, setUsers] = useState([]);
+  const [status, setStatus] = useState(inc.status || "OPEN");
+  const [assigned, setAssigned] = useState(inc.assigned_to || "");
+  const [notes, setNotes] = useState(inc.resolution_notes || "");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (editable) api("/api/users/lite").then(setUsers).catch(() => {});
+  }, [editable]);
+
+  async function save(next) {
+    setBusy(true); setErr("");
+    try {
+      const body = { status: next || status, assigned_to: assigned, resolution_notes: notes };
+      await api(`/incidents/${inc.incident_id}`, { method: "PATCH", body });
+      onSaved();
+    } catch (e) { setErr(e.message); setBusy(false); }
+  }
+  async function remove() {
+    if (!window.confirm(`Delete ${inc.incident_id}? This removes its screenshot and clip.`)) return;
+    try { await api(`/incidents/${inc.incident_id}`, { method: "DELETE" }); onSaved(); } catch (e) { setErr(e.message); }
+  }
+
+  const shot = asset("images", inc.screenshot);
+  const clip = asset("clips", inc.clip);
+  return (
+    <Modal title={`${inc.incident_id} - ${pretty(inc.violation)}`} onClose={onClose} wide>
+      <div className="split">
+        <div className="media">
+          {shot ? <img src={shot} alt="Incident screenshot" /> : <Empty>No screenshot saved.</Empty>}
+          {clip ? <video src={clip} controls preload="metadata" /> : <div className="hint">Video clip appears about {10} seconds after the incident.</div>}
+        </div>
+        <div>
+          <dl className="meta">
+            <dt>Severity</dt><dd><Sev value={inc.severity} /></dd>
+            <dt>Status</dt><dd><Status value={inc.status} /></dd>
+            <dt>Time</dt><dd>{fmtTime(inc.timestamp)}</dd>
+            <dt>Camera</dt><dd>{inc.camera_name || "-"}{inc.zone ? ` (${inc.zone})` : ""}</dd>
+            <dt>Confidence</dt><dd>{Math.round((inc.confidence || 0) * 100)}%</dd>
+            <dt>Worker track</dt><dd>{inc.track_id != null ? `#${inc.track_id}` : "-"}</dd>
+            <dt>Duration</dt><dd>{inc.duration_sec ? `${Math.round(inc.duration_sec)} s` : "-"}</dd>
+            <dt>Details</dt><dd>{inc.description || "-"}</dd>
+            {inc.resolved_at && (<><dt>Closed</dt><dd>{fmtTime(inc.resolved_at)}</dd></>)}
+          </dl>
+          {editable ? (
+            <>
+              <div className="field">
+                <label htmlFor="as">Assigned to</label>
+                <select id="as" value={assigned} onChange={(e) => setAssigned(e.target.value)}>
+                  <option value="">Nobody</option>
+                  {users.map((u) => <option key={u.id} value={u.name}>{u.name}</option>)}
+                  {assigned && !users.some((u) => u.name === assigned) && <option value={assigned}>{assigned}</option>}
+                </select>
+              </div>
+              <div className="field">
+                <label htmlFor="st">Status</label>
+                <select id="st" value={status} onChange={(e) => setStatus(e.target.value)}>
+                  {Object.entries(STATUS_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+                </select>
+              </div>
+              <div className="field">
+                <label htmlFor="nt">Resolution notes</label>
+                <textarea id="nt" rows={3} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="What was done about it?" />
+              </div>
+              {err && <div className="err">{err}</div>}
+              <div className="right" style={{ justifyContent: "flex-start" }}>
+                <button className="hivis" disabled={busy} onClick={() => save()}>Save changes</button>
+                {inc.status !== "RESOLVED" && <button disabled={busy} onClick={() => save("RESOLVED")}>Mark resolved</button>}
+                {inc.status !== "FALSE_POSITIVE" && <button className="ghost" disabled={busy} onClick={() => save("FALSE_POSITIVE")}>False alarm</button>}
+                {can("ADMIN") && <button className="danger" onClick={remove}>Delete</button>}
+              </div>
+            </>
+          ) : (
+            <>
+              <dl className="meta"><dt>Assigned to</dt><dd>{inc.assigned_to || "-"}</dd><dt>Notes</dt><dd>{inc.resolution_notes || "-"}</dd></dl>
+              <div className="hint">Supervisors and admins can update incidents.</div>
+            </>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+export default function Incidents() {
+  const { tick } = useLive();
+  const [f, setF] = useState(EMPTY);
+  const [applied, setApplied] = useState(EMPTY);
+  const [page, setPage] = useState(0);
+  const [data, setData] = useState({ items: [], total: 0 });
+  const [cams, setCams] = useState([]);
+  const [open, setOpen] = useState(null);
+  const [error, setError] = useState("");
+
+  const load = useCallback(() => {
+    api("/api/incidents", { params: { ...applied, limit: PAGE, offset: page * PAGE } })
+      .then((d) => { setData(d); setError(""); })
+      .catch((e) => setError(e.message));
+  }, [applied, page]);
+
+  useEffect(() => { load(); }, [load, tick]);
+  useEffect(() => { api("/api/cameras").then(setCams).catch(() => {}); }, []);
+
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const apply = (e) => { e && e.preventDefault(); setPage(0); setApplied(f); };
+  const reset = () => { setF(EMPTY); setApplied(EMPTY); setPage(0); };
+  const pages = Math.max(1, Math.ceil(data.total / PAGE));
+
+  async function exportAs(fmt) {
+    try { await download("/api/incidents/export", { ...applied, format: fmt }, fmt === "pdf" ? "Safety_Audit_Report.pdf" : `incidents.${fmt}`); }
+    catch (e) { setError(e.message); }
+  }
+
+  return (
+    <>
+      <div className="pagehead">
+        <div><h1>Incidents</h1><p>{data.total} matching. Click a row to review, assign or close it.</p></div>
+        <div className="right">
+          <button className="ghost" onClick={() => exportAs("csv")}>Export CSV</button>
+          <button className="ghost" onClick={() => exportAs("xlsx")}>Export Excel</button>
+          <button className="ghost" onClick={() => exportAs("pdf")}>Export PDF</button>
+        </div>
+      </div>
+
+      <form className="panel" onSubmit={apply} style={{ marginBottom: 16 }}>
+        <div className="filters">
+          <input placeholder="Search ID, camera, person" aria-label="Search" value={f.q} onChange={set("q")} />
+          <select aria-label="Status" value={f.status} onChange={set("status")}>
+            <option value="">Any status</option>
+            {Object.entries(STATUS_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+          </select>
+          <select aria-label="Severity" value={f.severity} onChange={set("severity")}>
+            <option value="">Any severity</option>
+            {["CRITICAL", "HIGH", "MEDIUM", "LOW"].map((s) => <option key={s} value={s}>{pretty(s.toLowerCase())}</option>)}
+          </select>
+          <select aria-label="Violation" value={f.violation} onChange={set("violation")}>
+            <option value="">Any violation</option>
+            {["no_helmet", "no_goggle", "no_gloves", "no_boots", "no_vest", "no_mask", "no_harness"].map((v) => <option key={v} value={v}>{pretty(v)}</option>)}
+          </select>
+          <select aria-label="Camera" value={f.camera_id} onChange={set("camera_id")}>
+            <option value="">Any camera</option>
+            {cams.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+          <button>Apply</button>
+        </div>
+        <div className="filters dates">
+          <div><label htmlFor="df">From</label><input id="df" type="date" value={f.date_from} onChange={set("date_from")} /></div>
+          <div><label htmlFor="dt">To</label><input id="dt" type="date" value={f.date_to} onChange={set("date_to")} /></div>
+          <div><button type="button" className="ghost" onClick={reset}>Clear filters</button></div>
+        </div>
+      </form>
+
+      {error && <div className="err">{error}</div>}
+      <section className="panel">
+        {data.items.length ? (
+          <div className="tablewrap">
+            <table>
+              <thead><tr><th>ID</th><th>Time</th><th>Violation</th><th>Severity</th><th>Camera</th><th>Conf.</th><th>Status</th><th>Assigned</th></tr></thead>
+              <tbody>
+                {data.items.map((i) => (
+                  <tr key={i.incident_id} className="click" tabIndex={0} onClick={() => setOpen(i)} onKeyDown={(e) => e.key === "Enter" && setOpen(i)}>
+                    <td><b>{i.incident_id}</b></td><td>{fmtTime(i.timestamp)}</td><td>{pretty(i.violation)}</td>
+                    <td><Sev value={i.severity} /></td><td>{i.camera_name || "-"}</td>
+                    <td>{Math.round((i.confidence || 0) * 100)}%</td><td><Status value={i.status} /></td><td>{i.assigned_to || "-"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <Empty>No incidents match these filters.</Empty>}
+        <div className="pager">
+          <span>Page {page + 1} of {pages}</span>
+          <div className="right">
+            <button className="ghost" disabled={page === 0} onClick={() => setPage(page - 1)}>Previous</button>
+            <button className="ghost" disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>Next</button>
+          </div>
+        </div>
+      </section>
+
+      {open && <Detail inc={open} onClose={() => setOpen(null)} onSaved={() => { setOpen(null); load(); }} />}
+    </>
+  );
+}

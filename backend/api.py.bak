@@ -1,0 +1,85 @@
+"""AI Sentinel API.   Run from the project root:  uvicorn backend.api:app --reload"""
+import asyncio
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from backend import camera_watch, config, db, report_scheduler, sla
+from backend.auth_routes import router as auth_router
+from backend.detector import manager
+from backend.events import bus
+from backend.routes_admin import router as admin_router
+from backend.routes_cameras import router as cameras_router
+from backend.routes_incidents import router as incidents_router
+from backend.routes_notifications import router as notifications_router
+from backend.routes_reports import router as reports_router
+from backend.routes_stats import router as stats_router
+
+
+@asynccontextmanager
+async def lifespan(app):
+    print("==========================================")
+    print("        AI SENTINEL STARTING")
+    print("==========================================")
+    db.init_db()
+    db.seed_default_camera()
+    bus.loop = asyncio.get_running_loop()
+    sla.start()
+    camera_watch.start()
+    report_scheduler.start()
+    if config.DISABLE_DETECTION:
+        print("Detection disabled (DISABLE_DETECTION=true) - API only")
+    else:
+        print("Model:", config.MODEL_PATH)
+        manager.start_all()
+    print("API:  http://127.0.0.1:8000   Docs: http://127.0.0.1:8000/docs")
+    yield
+    manager.stop_all()
+
+
+app = FastAPI(title="AI Sentinel API", description="Real-time PPE monitoring backend", version="2.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/images", StaticFiles(directory=config.INCIDENTS_DIR), name="images")
+app.mount("/clips", StaticFiles(directory=config.CLIPS_DIR), name="clips")
+app.mount("/proofs", StaticFiles(directory=config.PROOFS_DIR), name="proofs")
+
+app.include_router(auth_router)
+app.include_router(incidents_router)
+app.include_router(stats_router)
+app.include_router(cameras_router)
+app.include_router(admin_router)
+app.include_router(notifications_router)
+app.include_router(reports_router)
+
+
+@app.get("/health")
+def health():
+    cams = db.list_cameras()
+    online = sum(1 for c in cams if manager.info(c)["status"] == "online")
+    return {
+        "success": True,
+        "status": "online",
+        "service": "AI Sentinel API",
+        "model_loaded": os.path.exists(config.MODEL_PATH),
+        "detection_enabled": not config.DISABLE_DETECTION,
+        "cameras_total": len(cams),
+        "cameras_online": online,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.get("/")
+def home():
+    return {"system": "AI Sentinel", "status": "online", "docs": "/docs"}

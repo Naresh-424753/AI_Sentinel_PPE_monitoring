@@ -1,0 +1,11 @@
+person
+helmet
+no_helmet
+safety_vest
+no_vest
+gloves
+no_gloves
+goggle
+no_goggle
+boots
+no_boots

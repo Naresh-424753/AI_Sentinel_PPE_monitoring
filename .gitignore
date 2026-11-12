@@ -1,0 +1,14 @@
+.env
+.venv/
+node_modules/
+frontend/dist/
+__pycache__/
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+backend/incidents/
+backend/clips/
+backend/reports/
+backend/.jwt_secret
+runs/
+*.pt
